@@ -10,15 +10,118 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Create ZIP archive
         run: |
-          zip -r release.zip . -x "*.git*"
+          zip -r release.zip . -x "*.git*" -x "*.github/workflows/*"
 
-      - name: Upload to Zenodo
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # 1) Create a NEW VERSION draft from the existing deposition
+      - name: Create new Zenodo version draft
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          ZENODO_DEPOSITION_ID: ${{ secrets.ZENODO_DEPOSITION_ID }}
         run: |
-          curl -H "Content-Type: application/octet-stream" \
-               -H "Authorization: Bearer ${{ secrets.ZENODO_TOKEN }}" \
-               --upload-file release.zip \
-               https://zenodo.org/api/deposit/depositions/${{ secrets.ZENODO_DEPOSITION_ID }}/files?name=release.zip
+          set -euo pipefail
+
+          resp=$(curl -sS -f -X POST \
+            -H "Authorization: Bearer ${ZENODO_TOKEN}" \
+            "https://zenodo.org/api/deposit/depositions/${ZENODO_DEPOSITION_ID}/actions/newversion")
+
+          latest_draft_url=$(echo "$resp" | jq -r '.links.latest_draft')
+          new_id=$(echo "$latest_draft_url" | sed -E 's#.*/deposit/depositions/([0-9]+).*#\1#')
+
+          echo "NEW_DEPOSITION_ID=$new_id" >> $GITHUB_ENV
+
+      # 2) Update metadata (including LICENSE = CC BY-SA 4.0)
+      - name: Update Zenodo metadata (license = CC BY-SA 4.0)
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          NEW_DEPOSITION_ID: ${{ env.NEW_DEPOSITION_ID }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          cat > metadata.json << 'JSON'
+          {
+            "metadata": {
+              "upload_type": "software",
+              "title": "Salpida Foundation — Canonical Repository (salpida-canonical)",
+              "version": "__VERSION__",
+              "description": "This repository serves as the public canonical index for the Consciousness Civilization Framework (CCF) and the CAIS-based constitutional document stack. All binding authority, meaning, and interpretive validity are fixed exclusively through DOI-registered canonical records hosted on Zenodo and OSF. GitHub content is provided solely for discovery, indexing, and navigational purposes and carries no independent authority.",
+              "creators": [
+                { "name": "Lee, Jinho", "orcid": "0009-0005-3809-4588" }
+              ],
+              "access_right": "open",
+              "license": "cc-by-sa-4.0",
+              "keywords": [
+                "CCF",
+                "CAIS",
+                "canonical",
+                "DOI",
+                "Zenodo",
+                "OSF",
+                "non-authoritative-repository"
+              ]
+            }
+          }
+          JSON
+
+          # inject version
+          sed -i "s/__VERSION__/${RELEASE_TAG}/g" metadata.json
+
+          curl -sS -f -X PUT \
+            -H "Authorization: Bearer ${ZENODO_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data @metadata.json \
+            "https://zenodo.org/api/deposit/depositions/${NEW_DEPOSITION_ID}"
+
+      # 3) Remove existing files in the draft (avoid duplicates)
+      - name: Clean draft files
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          NEW_DEPOSITION_ID: ${{ env.NEW_DEPOSITION_ID }}
+        run: |
+          set -euo pipefail
+
+          files=$(curl -sS -f \
+            -H "Authorization: Bearer ${ZENODO_TOKEN}" \
+            "https://zenodo.org/api/deposit/depositions/${NEW_DEPOSITION_ID}" | jq -r '.files[].id // empty')
+
+          if [ -n "$files" ]; then
+            for fid in $files; do
+              curl -sS -f -X DELETE \
+                -H "Authorization: Bearer ${ZENODO_TOKEN}" \
+                "https://zenodo.org/api/deposit/depositions/${NEW_DEPOSITION_ID}/files/${fid}" >/dev/null
+            done
+          fi
+
+      # 4) Upload file via multipart POST (fixes 405-style issues)
+      - name: Upload ZIP to Zenodo
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          NEW_DEPOSITION_ID: ${{ env.NEW_DEPOSITION_ID }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          curl -sS -f -X POST \
+            -H "Authorization: Bearer ${ZENODO_TOKEN}" \
+            -F "file=@release.zip" \
+            -F "name=salpida-canonical-${RELEASE_TAG}.zip" \
+            "https://zenodo.org/api/deposit/depositions/${NEW_DEPOSITION_ID}/files"
+
+      # 5) Publish the draft
+      - name: Publish on Zenodo
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          NEW_DEPOSITION_ID: ${{ env.NEW_DEPOSITION_ID }}
+        run: |
+          set -euo pipefail
+
+          curl -sS -f -X POST \
+            -H "Authorization: Bearer ${ZENODO_TOKEN}" \
+            "https://zenodo.org/api/deposit/depositions/${NEW_DEPOSITION_ID}/actions/publish"
